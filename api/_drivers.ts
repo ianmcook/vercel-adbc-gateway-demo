@@ -1,4 +1,4 @@
-import { mkdir, readdir, readFile, stat } from "node:fs/promises";
+import { mkdir, readdir, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Readable } from "node:stream";
@@ -12,6 +12,11 @@ const INDEX_URL = `${CDN_BASE}/index.yaml`;
 
 // Vercel Functions run on Linux/amd64, so that is the only build we fetch.
 const PLATFORM = "linux_amd64";
+
+// Vercel's /tmp is capped at 500 MB. Bound the extracted-driver cache below
+// that so accumulating many drivers on one warm instance can't overflow it;
+// when a new driver won't fit, the least-recently-used drivers are evicted.
+const CACHE_BUDGET_BYTES = 400 * 1024 * 1024;
 
 export interface DriverInfo {
   sharedLibPath: string;
@@ -39,6 +44,18 @@ interface Registry {
 const installRoot = join(tmpdir(), "adbc-drivers");
 
 const inflight = new Map<string, Promise<DriverInfo>>();
+
+// Driver directories currently being downloaded/extracted. Eviction must never
+// touch these, or a concurrent request could delete another's partial install.
+const building = new Set<string>();
+
+// LRU recency for cached driver directories, keyed by absolute path. A
+// monotonic counter (rather than a clock) orders evictions: lowest = oldest.
+const lastUsed = new Map<string, number>();
+let useTick = 0;
+function touch(dir: string): void {
+  lastUsed.set(dir, ++useTick);
+}
 
 // The registry index is fetched once per instance and cached. Latest-version
 // resolution is therefore pinned for an instance's lifetime, which is fine for
@@ -109,6 +126,17 @@ function pickLatest(releases: RegistryRelease[]): RegistryRelease {
   );
 }
 
+// Compressed size of a driver tarball via a HEAD request, used to budget the
+// cache before downloading. Returns 0 if the server omits Content-Length.
+async function headContentLength(url: string): Promise<number> {
+  try {
+    const res = await fetch(url, { method: "HEAD" });
+    return Number(res.headers.get("content-length")) || 0;
+  } catch {
+    return 0;
+  }
+}
+
 async function downloadAndExtract(url: string, dest: string): Promise<void> {
   await mkdir(dest, { recursive: true });
   const res = await fetch(url);
@@ -121,6 +149,9 @@ async function downloadAndExtract(url: string, dest: string): Promise<void> {
     createWriteStream(tarball),
   );
   await tarExtract({ file: tarball, cwd: dest });
+  // Drop the tarball once extracted — only the unpacked driver is needed, and
+  // keeping both would nearly double this driver's /tmp footprint.
+  await rm(tarball, { force: true });
 }
 
 // Each driver tarball ships a MANIFEST (TOML) naming the shared library under
@@ -144,6 +175,69 @@ async function resolveDriverInfo(dest: string): Promise<DriverInfo> {
   }
   const entryMatch = /^\s*entrypoint\s*=\s*"(.+?)"\s*$/m.exec(manifest);
   return { sharedLibPath, entrypoint: entryMatch?.[1] };
+}
+
+// Total bytes of the regular files directly inside a driver directory. Driver
+// tarballs are flat (the .so plus a few small license/manifest files), so a
+// shallow scan is sufficient.
+async function dirSize(dir: string): Promise<number> {
+  let total = 0;
+  let entries: string[];
+  try {
+    entries = await readdir(dir);
+  } catch {
+    return 0;
+  }
+  for (const name of entries) {
+    try {
+      const s = await stat(join(dir, name));
+      if (s.isFile()) total += s.size;
+    } catch {
+      // File vanished (e.g. concurrent eviction) — ignore.
+    }
+  }
+  return total;
+}
+
+// Evict least-recently-used cached driver directories until `incoming` bytes
+// would fit within the cache budget. Directories currently being downloaded
+// (in `building`) are never evicted, so a concurrent install can't be deleted.
+async function evictToFit(incoming: number): Promise<void> {
+  const dirs = new Map<string, number>(); // dir -> size
+  let schemes: string[];
+  try {
+    schemes = await readdir(installRoot);
+  } catch {
+    return; // nothing cached yet
+  }
+  for (const scheme of schemes) {
+    const schemeDir = join(installRoot, scheme);
+    let versions: string[];
+    try {
+      versions = await readdir(schemeDir);
+    } catch {
+      continue;
+    }
+    for (const version of versions) {
+      const dir = join(schemeDir, version);
+      if (building.has(dir)) continue;
+      dirs.set(dir, await dirSize(dir));
+    }
+  }
+
+  let used = 0;
+  for (const size of dirs.values()) used += size;
+
+  // Evict oldest-first until the incoming driver fits within the budget.
+  const ordered = [...dirs.keys()].sort(
+    (a, b) => (lastUsed.get(a) ?? 0) - (lastUsed.get(b) ?? 0),
+  );
+  for (const dir of ordered) {
+    if (used + incoming <= CACHE_BUDGET_BYTES) break;
+    await rm(dir, { recursive: true, force: true });
+    used -= dirs.get(dir) ?? 0;
+    lastUsed.delete(dir);
+  }
 }
 
 /**
@@ -172,20 +266,33 @@ export async function ensureDriver(scheme: string): Promise<DriverInfo> {
   }
 
   const dest = join(installRoot, scheme, release.version);
+  const url = `${CDN_BASE}/${pkg.url}`;
+
   // A present MANIFEST means a previous invocation already extracted this
   // version; re-derive the (cheap) driver info from it instead of downloading.
   if (await pathExists(join(dest, "MANIFEST"))) {
+    touch(dest);
     return resolveDriverInfo(dest);
   }
 
   const key = `${scheme}@${release.version}`;
   let task = inflight.get(key);
   if (!task) {
+    building.add(dest);
     task = (async () => {
-      await downloadAndExtract(`${CDN_BASE}/${pkg.url}`, dest);
+      // Make room before extracting so the cache stays within budget. Estimate
+      // the extracted size from the compressed download (~4x; measured ratios
+      // are 3.0–3.7x) and evict other drivers' caches LRU-first to fit it.
+      const compressed = await headContentLength(url);
+      await evictToFit(compressed * 4);
+      await downloadAndExtract(url, dest);
+      touch(dest);
       return resolveDriverInfo(dest);
     })();
-    task.finally(() => inflight.delete(key));
+    task.finally(() => {
+      inflight.delete(key);
+      building.delete(dest);
+    });
     inflight.set(key, task);
   }
   return task;

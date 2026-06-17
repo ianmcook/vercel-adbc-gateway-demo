@@ -12,6 +12,14 @@ the scheme in the URI (e.g. `snowflake://`, `postgresql://`, `duckdb://`,
 `bigquery://`) selects the driver, and the latest version is downloaded on
 demand on first use. No driver is bundled or hardcoded.
 
+> [!NOTE]
+> Vercel Functions are not really the ideal architecture for this. The
+> ephemeral filesystem, per-request driver downloads, cold starts, and
+> execution time limits all work against a long-lived database gateway, and a
+> persistent server would handle it more naturally. This project exists to
+> demonstrate that running ADBC drivers on Vercel Functions is nonetheless
+> possible — not to recommend it as a production pattern.
+
 ## `/api/query`
 
 `POST` a JSON body and get back an Arrow IPC stream
@@ -19,7 +27,7 @@ demand on first use. No driver is bundled or hardcoded.
 `Content-Length`):
 
 ```sh
-curl -X POST https://<your-deployment>.vercel.app/api/query \
+curl -X POST https://vercel-adbc-gateway-demo.vercel.app/api/query \
   -H 'content-type: application/json' \
   --data '{"uri":"snowflake://user:pass@account/DB/SCHEMA?warehouse=WH","sql":"SELECT 1 AS x"}' \
   --output result.arrows
@@ -45,9 +53,8 @@ using.
 
 ## How it works
 
-The function runs on the `@vercel/node` runtime (the Edge runtime cannot load
-the native ADBC driver-manager bindings). On the first request for a given
-scheme, [`api/_drivers.ts`](./api/_drivers.ts):
+The function runs on the `@vercel/node` runtime. On the first request for a
+given scheme, [`api/_drivers.ts`](./api/_drivers.ts):
 
 1. fetches the registry index (`index.yaml`) and finds the driver whose `path`
    equals the URI scheme,
@@ -57,7 +64,22 @@ scheme, [`api/_drivers.ts`](./api/_drivers.ts):
    tarball's `MANIFEST`.
 
 The driver is cached in `/tmp` and reused by later requests on the same
-instance.
+instance. Because Vercel's `/tmp` is limited to 500 MB, the cache is bounded:
+the download tarball is deleted after extraction, and when a new driver would
+exceed the budget the least-recently-used cached drivers are evicted to make
+room (so a single warm instance can serve many drivers without overflowing).
+
+## Benchmarking
+
+Don't time the first request: it pays one-time costs — a cold boot plus the
+driver download and extraction — that won't recur, so it badly overstates
+steady-state latency. Send a warm-up request for the same driver first and
+discard it, then measure several runs against the warm instance and report the
+median (cold starts and evictions still cause occasional outliers). Bear in
+mind a driver evicted to stay under the `/tmp` budget will be re-downloaded on
+its next use, so benchmarking many different drivers in one run can reintroduce
+download latency — pin your test to a single driver to measure query
+performance alone.
 
 ## Client
 
@@ -67,7 +89,7 @@ a table. See [`client/README.md`](./client/README.md).
 ```sh
 cd client
 npm install
-URL=https://<your-deployment>.vercel.app/api/query \
+URL=https://vercel-adbc-gateway-demo.vercel.app/api/query \
   node client.mjs "snowflake://user:pass@account/DB/SCHEMA" "SELECT 1 AS x"
 ```
 
@@ -84,25 +106,5 @@ URL=https://<your-deployment>.vercel.app/api/query \
 
 ```sh
 npm install
-vercel        # preview deployment
-vercel --prod # production
-```
-
-No environment variables or build step are required — all driver credentials
-are passed per-request in the `uri`.
-
-## Local development
-
-```sh
-npm install
-vercel dev
-```
-
-Then point the client at it (this is the client's default if `URL` is unset):
-
-```sh
-cd client
-npm install
-URL=http://localhost:3000/api/query \
-  node client.mjs "snowflake://user:pass@account/DB/SCHEMA" "SELECT 1 AS x"
+vercel --prod
 ```

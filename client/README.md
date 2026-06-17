@@ -18,11 +18,10 @@ npm install
 
 ## Usage
 
-Set `URL` to your deployment's endpoint (it defaults to
-`http://localhost:3000/api/query` for use with `vercel dev`):
+Set `URL` to your deployment's endpoint:
 
 ```sh
-URL=https://<your-deployment>.vercel.app/api/query \
+URL=https://vercel-adbc-gateway-demo.vercel.app/api/query \
   node client.mjs "snowflake://user:pass@account/DB/SCHEMA?warehouse=WH" "SELECT 1 AS x"
 ```
 

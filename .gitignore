@@ -1,0 +1,11 @@
+node_modules
+.vercel
+.env
+.env.*
+!.env.example
+*.log
+.DS_Store
+
+# Scratch query-result dumps.
+/*.arrow
+/*.arrows

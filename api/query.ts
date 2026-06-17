@@ -16,13 +16,34 @@ export default async function handler(
   const { uri, sql } = req.body;
   const driver = uri.slice(0, uri.indexOf(":"));
 
+  // Embedded drivers (duckdb, sqlite) take a database path, not a connection
+  // string: a bare 'duckdb://' / 'sqlite://' means "no database", so pass no
+  // uri and let them open in-memory. Everything else is forwarded verbatim.
+  const isEmbedded = driver === "duckdb" || driver === "sqlite";
+  const databaseOptions: Record<string, string> =
+    isEmbedded && uri.slice(uri.indexOf("://") + 3).length === 0
+      ? {}
+      : { uri };
+
   const { sharedLibPath, entrypoint } = await ensureDriver(driver);
   const db = new AdbcDatabase({
     driver: sharedLibPath,
     entrypoint,
-    databaseOptions: { uri },
+    databaseOptions,
   });
   const connection = await db.connect();
+
+  // DataFusion emits string columns as the Arrow StringView type, which the
+  // apache-arrow JS library cannot decode (the stream stalls on such a batch).
+  // Disable view types so strings come back as plain String.
+  if (driver === "datafusion") {
+    await connection.execute(
+      "SET datafusion.execution.parquet.schema_force_view_types = false",
+    );
+    await connection.execute(
+      "SET datafusion.sql_parser.map_string_types_to_utf8view = false",
+    );
+  }
 
   res.setHeader("content-type", "application/vnd.apache.arrow.stream");
   const reader = await connection.queryStream(sql);
